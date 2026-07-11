@@ -72,7 +72,7 @@ func OapiYaml(inputFile, outputFile string) error {
 		return err
 	}
 
-	data, err = yaml.MarshalWithOptions(&mainAPI, yaml.Indent(2))
+	data, err = yaml.MarshalWithOptions(&mainAPI, yaml.Indent(2), yaml.UseLiteralStyleIfMultiline(true))
 	if err != nil {
 		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
