@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goccy/go-yaml"
 )
 
 func TestOapiYaml(t *testing.T) {
@@ -187,6 +189,253 @@ paths:
 	}
 }
 
+func TestOapiYamlMergesTransitivelyReferencedComponents(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+	pathsDir := filepath.Join(tmpDir, "paths")
+	componentsDir := filepath.Join(tmpDir, "components")
+	schemasDir := filepath.Join(componentsDir, "schemas")
+
+	for _, dir := range []string{pathsDir, schemasDir} {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			t.Fatalf("create fixture directory: %v", err)
+		}
+	}
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /users:
+    $ref: './paths/users.yaml#/users'
+`)
+	writeFile(t, filepath.Join(pathsDir, "users.yaml"), `
+users:
+  get:
+    responses:
+      "200":
+        $ref: '../components/responses.yaml#/components/responses/OK'
+`)
+	writeFile(t, filepath.Join(componentsDir, "responses.yaml"), `
+components:
+  responses:
+    OK:
+      description: Success
+      content:
+        application/json:
+          schema:
+            $ref: './schemas/user.yaml#/components/schemas/User'
+`)
+	writeFile(t, filepath.Join(schemasDir, "user.yaml"), `
+components:
+  schemas:
+    User:
+      type: object
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read merged output: %v", err)
+	}
+
+	var merged OpenAPI
+	if err := yaml.UnmarshalWithOptions(data, &merged, yaml.UseOrderedMap()); err != nil {
+		t.Fatalf("parse merged output: %v", err)
+	}
+
+	pathResponseRef := mapValueAt(
+		t,
+		merged.Paths,
+		"/users",
+		"get",
+		"responses",
+		"200",
+		"$ref",
+	)
+	if pathResponseRef != "#/components/responses/OK" {
+		t.Errorf("path response ref = %v, want #/components/responses/OK", pathResponseRef)
+	}
+
+	responseSchemaRef := mapValueAt(
+		t,
+		merged.Components,
+		"responses",
+		"OK",
+		"content",
+		"application/json",
+		"schema",
+		"$ref",
+	)
+	if responseSchemaRef != "#/components/schemas/User" {
+		t.Errorf("response schema ref = %v, want #/components/schemas/User", responseSchemaRef)
+	}
+
+	if got := mapValueAt(
+		t,
+		merged.Components,
+		"schemas",
+		"User",
+		"type",
+	); got != "object" {
+		t.Errorf("transitively referenced schema type = %v, want object", got)
+	}
+}
+
+func TestOapiYamlIgnoresReferencesFromDiscardedComponents(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /users:
+    $ref: './paths.yaml#/users'
+components:
+  schemas:
+    User:
+      type: object
+`)
+	writeFile(t, filepath.Join(tmpDir, "paths.yaml"), `
+users:
+  get:
+    responses:
+      "200":
+        description: Success
+components:
+  schemas:
+    User:
+      $ref: './missing.yaml#/components/schemas/Missing'
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error from discarded component reference: %v", err)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read merged output: %v", err)
+	}
+
+	var merged OpenAPI
+	if err := yaml.UnmarshalWithOptions(data, &merged, yaml.UseOrderedMap()); err != nil {
+		t.Fatalf("parse merged output: %v", err)
+	}
+
+	if got := mapValueAt(
+		t,
+		merged.Components,
+		"schemas",
+		"User",
+		"type",
+	); got != "object" {
+		t.Errorf("main component type = %v, want object", got)
+	}
+}
+
+func TestOapiYamlHandlesSymlinkedComponentCycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+	componentsDir := filepath.Join(tmpDir, "components")
+
+	if err := os.MkdirAll(componentsDir, 0750); err != nil {
+		t.Fatalf("create components directory: %v", err)
+	}
+	if err := os.Symlink(".", filepath.Join(componentsDir, "alias")); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#/test'
+`)
+	writeFile(t, filepath.Join(tmpDir, "paths.yaml"), `
+test:
+  get:
+    responses:
+      "200":
+        description: Success
+        content:
+          application/json:
+            schema:
+              $ref: './components/a.yaml#/components/schemas/A'
+`)
+	writeFile(t, filepath.Join(componentsDir, "a.yaml"), `
+components:
+  schemas:
+    A:
+      type: object
+      properties:
+        b:
+          $ref: './alias/b.yaml#/components/schemas/B'
+`)
+	writeFile(t, filepath.Join(componentsDir, "b.yaml"), `
+components:
+  schemas:
+    B:
+      type: object
+      properties:
+        a:
+          $ref: './alias/a.yaml#/components/schemas/A'
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error from symlinked component cycle: %v", err)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read merged output: %v", err)
+	}
+
+	var merged OpenAPI
+	if err := yaml.UnmarshalWithOptions(data, &merged, yaml.UseOrderedMap()); err != nil {
+		t.Fatalf("parse merged output: %v", err)
+	}
+
+	aRef := mapValueAt(
+		t,
+		merged.Components,
+		"schemas",
+		"A",
+		"properties",
+		"b",
+		"$ref",
+	)
+	if aRef != "#/components/schemas/B" {
+		t.Errorf("A.b ref = %v, want #/components/schemas/B", aRef)
+	}
+
+	bRef := mapValueAt(
+		t,
+		merged.Components,
+		"schemas",
+		"B",
+		"properties",
+		"a",
+		"$ref",
+	)
+	if bRef != "#/components/schemas/A" {
+		t.Errorf("B.a ref = %v, want #/components/schemas/A", bRef)
+	}
+}
+
 func TestOutputStructure(t *testing.T) {
 	tmpDir := t.TempDir()
 	input := filepath.Join(tmpDir, "api.yaml")
@@ -249,4 +498,23 @@ func writeFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write %s: %v", path, err)
 	}
+}
+
+func mapValueAt(t *testing.T, root yaml.MapSlice, keys ...string) any {
+	t.Helper()
+
+	var value any = root
+	for _, key := range keys {
+		current, ok := value.(yaml.MapSlice)
+		if !ok {
+			t.Fatalf("value at %q has type %T, want yaml.MapSlice", strings.Join(keys, "."), value)
+		}
+
+		value = getMapSliceValue(current, key)
+		if value == nil {
+			t.Fatalf("key %q not found at %q", key, strings.Join(keys, "."))
+		}
+	}
+
+	return value
 }
