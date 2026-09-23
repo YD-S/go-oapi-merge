@@ -11,9 +11,67 @@
 ## Features
 
 - **Resolves `$ref` References**: Automatically resolves and merges external references in OpenAPI files.
+- **OpenAPI 3.0, 3.1, and 3.2 Support**: Merges documents on any of these versions, including native OpenAPI 3.2 hierarchical tags (`tags[].parent`).
+- **Lossless for Unknown Fields**: Any root-level field the tool doesn't specifically process — vendor `x-*` extensions, `webhooks`, `jsonSchemaDialect`, `$self`, `summary`, or fields introduced by future OpenAPI versions — passes through untouched instead of being silently dropped.
 - **Simple CLI Interface**: Easy-to-use command-line tool for quick integration into your workflow.
 - **Customizable Input/Output**: Specify input and output file paths for flexible usage.
 - **Cross-Platform**: Built in Go, it works seamlessly on Windows, macOS, and Linux.
+
+---
+
+## OpenAPI Version Support
+
+`go-oapi-merge` does not validate or restrict the `openapi` version field, whatever string is in the input document (e.g. `3.0.0`, `3.0.3`, `3.1.0`, `3.2.0`) is carried through unchanged to the output.
+
+In practice this means:
+
+- **OpenAPI 3.0.x**: Fully supported. This is the format the tool was originally built around.
+- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`webhooks`, `jsonSchemaDialect`, root-level `$ref` via `$self`, etc.) are preserved rather than dropped.
+- **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below). As with 3.1, any 3.2-specific root field is preserved as-is.
+
+Because the tool merges YAML structurally rather than validating against a JSON Schema for a specific OpenAPI version, it does not by itself guarantee the *output* is spec-valid — it guarantees it faithfully reflects the *input*. Run the result through an OpenAPI validator (e.g. [Redocly CLI](https://redocly.com/docs/cli/) or [Spectral](https://github.com/stoplightio/spectral)) as part of your pipeline if you need that guarantee.
+
+---
+
+## Hierarchical Tags (OpenAPI 3.2)
+
+OpenAPI 3.2 introduces native support for organizing tags into a hierarchy via the `parent` field on each tag object. `go-oapi-merge` preserves `tags[].parent` — along with `description`, `externalDocs`, and any other tag field — exactly as written. It is **not** converted into a vendor extension like `x-tagGroups`; `parent` is emitted as a native OpenAPI 3.2 field.
+
+```yaml
+openapi: 3.2.0
+
+info:
+  title: Example API
+  version: 1.0.0
+
+tags:
+  - name: Catalog
+
+  - name: Categories
+    parent: Catalog
+
+  - name: Items
+    parent: Catalog
+
+paths:
+  /categories:
+    get:
+      tags:
+        - Categories
+      responses:
+        "200":
+          description: OK
+```
+
+Tags can also live in a modular project and be merged the same way as paths and components. See [`example/openapi3.2`](example/openapi3.2) for a complete multi-file example (`root.yaml` referencing `categories.yaml` and `items.yaml`) where the root document declares the tag hierarchy and the referenced files supply the tagged paths — run it with:
+
+```bash
+go-oapi-merge -input example/openapi3.2/root.yaml -output merged.yaml
+```
+
+### Limitations
+
+- The merger does not validate that a tag's `parent` refers to a tag that actually exists elsewhere in the document, or that the hierarchy is free of cycles — it passes the `tags` array through as-is. Validate the merged output with an OpenAPI 3.2-aware validator if that guarantee matters to you.
 
 ---
 
