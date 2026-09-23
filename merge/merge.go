@@ -38,11 +38,16 @@ func (e *MergeError) Unwrap() error {
 // topLevelFieldOrder defines the canonical ordering of the well-known
 // OpenAPI root fields in the merged output. The document is otherwise
 // parsed generically (see OapiYaml) so that any other root-level field,
-// including OpenAPI 3.1/3.2 additions such as "webhooks",
-// "jsonSchemaDialect", "$self", "summary", or vendor "x-" extensions,
-// is preserved verbatim, in its original relative order, after these fields
-// instead of being silently dropped.
-var topLevelFieldOrder = []string{"openapi", "info", "servers", "paths", "components", "security", "tags"}
+// including OpenAPI 3.1/3.2 additions such as "jsonSchemaDialect",
+// "$self", "summary", or vendor "x-" extensions, is preserved verbatim,
+// in its original relative order, after these fields instead of being
+// silently dropped.
+//
+// "webhooks" (OpenAPI 3.1+) is included here rather than left to fall
+// through to that generic passthrough because it has the same shape as
+// "paths" — a map of Path Item Objects, each of which may itself be a
+// "$ref" — and so needs the same cross-file $ref resolution.
+var topLevelFieldOrder = []string{"openapi", "info", "servers", "paths", "webhooks", "components", "security", "tags"}
 
 func OapiYaml(inputFile, outputFile string) error {
 	data, err := os.ReadFile(inputFile)
@@ -68,11 +73,16 @@ func OapiYaml(inputFile, outputFile string) error {
 	security := getMapSliceValue(doc, "security")
 	tags := getMapSliceValue(doc, "tags")
 	paths, _ := getMapSliceValue(doc, "paths").(yaml.MapSlice)
+	webhooksPresent := getMapSliceValue(doc, "webhooks") != nil
+	webhooks, _ := getMapSliceValue(doc, "webhooks").(yaml.MapSlice)
 	components, _ := getMapSliceValue(doc, "components").(yaml.MapSlice)
 	extra := extraTopLevelFields(doc)
 
 	urlsToParse := make(map[string]bool)
-	if err := processPaths(&paths, urlsToParse, inputFile); err != nil {
+	if err := processPathItemMap(&paths, urlsToParse, inputFile); err != nil {
+		return err
+	}
+	if err := processPathItemMap(&webhooks, urlsToParse, inputFile); err != nil {
 		return err
 	}
 
@@ -87,6 +97,9 @@ func OapiYaml(inputFile, outputFile string) error {
 		merged = append(merged, yaml.MapItem{Key: "servers", Value: servers})
 	}
 	merged = append(merged, yaml.MapItem{Key: "paths", Value: paths})
+	if webhooksPresent {
+		merged = append(merged, yaml.MapItem{Key: "webhooks", Value: webhooks})
+	}
 	if len(components) > 0 {
 		merged = append(merged, yaml.MapItem{Key: "components", Value: components})
 	}
@@ -129,7 +142,11 @@ func isNonEmptySequence(v any) bool {
 	return ok && len(s) > 0
 }
 
-func processPaths(paths *yaml.MapSlice, urlsToParse map[string]bool, currentFilePath string) error {
+// processPathItemMap resolves whole-item "$ref"s in a map of Path Item
+// Objects, fetching and inlining the referenced content. It is used for
+// both "paths" and "webhooks" (OpenAPI 3.1+), since both fields share the
+// same "name -> Path Item Object" shape.
+func processPathItemMap(paths *yaml.MapSlice, urlsToParse map[string]bool, currentFilePath string) error {
 	for i := range *paths {
 		pathKey := (*paths)[i].Key.(string)
 		pathValue := (*paths)[i].Value

@@ -12,7 +12,8 @@
 
 - **Resolves `$ref` References**: Automatically resolves and merges external references in OpenAPI files.
 - **OpenAPI 3.0, 3.1, and 3.2 Support**: Merges documents on any of these versions, including native OpenAPI 3.2 hierarchical tags (`tags[].parent`).
-- **Lossless for Unknown Fields**: Any root-level field the tool doesn't specifically process — vendor `x-*` extensions, `webhooks`, `jsonSchemaDialect`, `$self`, `summary`, or fields introduced by future OpenAPI versions — passes through untouched instead of being silently dropped.
+- **Lossless for Unknown Fields**: Any root-level field the tool doesn't specifically process — vendor `x-*` extensions, `jsonSchemaDialect`, `$self`, `summary`, or fields introduced by future OpenAPI versions — passes through untouched instead of being silently dropped.
+- **`webhooks` Support (OpenAPI 3.1+)**: `webhooks` entries are resolved and merged the same way as `paths` — a whole-item `$ref` to another file is fetched, inlined, and any refs nested inside it are followed and merged into `components` too.
 - **Simple CLI Interface**: Easy-to-use command-line tool for quick integration into your workflow.
 - **Customizable Input/Output**: Specify input and output file paths for flexible usage.
 - **Cross-Platform**: Built in Go, it works seamlessly on Windows, macOS, and Linux.
@@ -26,7 +27,7 @@
 In practice this means:
 
 - **OpenAPI 3.0.x**: Fully supported. This is the format the tool was originally built around.
-- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`webhooks`, `jsonSchemaDialect`, root-level `$ref` via `$self`, etc.) are preserved rather than dropped.
+- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`jsonSchemaDialect`, root-level `$ref` via `$self`, etc.) are preserved rather than dropped, and `webhooks` gets the same `$ref` resolution as `paths` (see above).
 - **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below). As with 3.1, any 3.2-specific root field is preserved as-is.
 
 Because the tool merges YAML structurally rather than validating against a JSON Schema for a specific OpenAPI version, it does not by itself guarantee the *output* is spec-valid — it guarantees it faithfully reflects the *input*. Run the result through an OpenAPI validator (e.g. [Redocly CLI](https://redocly.com/docs/cli/) or [Spectral](https://github.com/stoplightio/spectral)) as part of your pipeline if you need that guarantee.

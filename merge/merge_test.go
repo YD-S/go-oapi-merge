@@ -851,6 +851,105 @@ x-custom-extension: hello
 	}
 }
 
+func TestOapiYamlResolvesWebhookReferences(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	webhookDefs := filepath.Join(tmpDir, "webhook-defs.yaml")
+	schemas := filepath.Join(tmpDir, "schemas.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: 3.1.0
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+webhooks:
+  newItem:
+    $ref: './webhook-defs.yaml#/newItem'
+`)
+	writeFile(t, webhookDefs, `
+newItem:
+  post:
+    summary: New item webhook
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: './schemas.yaml#/components/schemas/Item'
+    responses:
+      "200":
+        description: OK
+`)
+	writeFile(t, schemas, `
+components:
+  schemas:
+    Item:
+      type: object
+      properties:
+        name:
+          type: string
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	webhooks, ok := getMapSliceValue(doc, "webhooks").(yaml.MapSlice)
+	if !ok {
+		t.Fatalf("webhooks missing or wrong type")
+	}
+
+	// The external $ref must be resolved (inlined) rather than left dangling.
+	if got := mapValueAt(t, webhooks, "newItem", "post", "summary"); got != "New item webhook" {
+		t.Errorf("webhooks.newItem.post.summary = %v, want %q", got, "New item webhook")
+	}
+
+	// The transitively referenced schema must be rewritten to a local ref
+	// and its content merged into components, exactly like a path $ref.
+	schemaRef := mapValueAt(t, webhooks, "newItem", "post", "requestBody", "content", "application/json", "schema", "$ref")
+	if schemaRef != "#/components/schemas/Item" {
+		t.Errorf("webhook schema ref = %v, want #/components/schemas/Item", schemaRef)
+	}
+	_, components := docPathsAndComponents(t, doc)
+	if got := mapValueAt(t, components, "schemas", "Item", "type"); got != "object" {
+		t.Errorf("Item.type = %v, want object", got)
+	}
+}
+
+func TestOapiYamlOmitsAbsentWebhooks(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: 3.0.0
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	if getMapSliceValue(doc, "webhooks") != nil {
+		t.Error("webhooks should not be synthesized when absent from input")
+	}
+}
+
 func unmarshalDoc(t *testing.T, path string) yaml.MapSlice {
 	t.Helper()
 	data, err := os.ReadFile(path)
