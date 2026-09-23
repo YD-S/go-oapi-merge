@@ -35,39 +35,27 @@ func (e *MergeError) Unwrap() error {
 	return e.Cause
 }
 
-// OpenAPI is kept for source compatibility with code that imports this
-// package as a library and unmarshals/constructs documents with it
-// directly.
+// OpenAPI models the root fields of an OpenAPI document. Nested content
+// (Info, Paths, Webhooks, Components, and each entry of
+// Servers/Security/Tags) is represented generically as yaml.MapSlice/[]any
+// rather than further-typed structs, so that fields within them the
+// merger doesn't process directly — like OpenAPI 3.2's tags[].parent, or
+// a tag's description/externalDocs — still round-trip unchanged.
 //
-// Deprecated: OapiYaml no longer uses this type internally. it parses
-// the whole document as a generic yaml.MapSlice instead, so that root
-// fields this struct doesn't know about (OpenAPI 3.1/3.2 additions such
-// as "webhooks", "jsonSchemaDialect", "$self", "summary", or vendor "x-"
-// extensions) aren't silently dropped during merge. This type will be
-// removed in a future major version.
+// Root-level fields not listed here — OpenAPI 3.1's "jsonSchemaDialect",
+// 3.2's "$self"/"summary", "externalDocs", and vendor "x-" extensions
+// aren't modeled as struct fields, but OapiYaml still preserves them
+// verbatim; see extraRootFields.
 type OpenAPI struct {
 	OpenAPI    string        `yaml:"openapi"`
 	Info       yaml.MapSlice `yaml:"info"`
 	Servers    []any         `yaml:"servers,omitempty"`
 	Paths      yaml.MapSlice `yaml:"paths"`
+	Webhooks   yaml.MapSlice `yaml:"webhooks,omitempty"`
 	Components yaml.MapSlice `yaml:"components,omitempty"`
 	Security   []any         `yaml:"security,omitempty"`
 	Tags       []any         `yaml:"tags,omitempty"`
 }
-
-// topLevelFieldOrder defines the canonical ordering of the well-known
-// OpenAPI root fields in the merged output. The document is otherwise
-// parsed generically (see OapiYaml) so that any other root-level field,
-// including OpenAPI 3.1/3.2 additions such as "jsonSchemaDialect",
-// "$self", "summary", or vendor "x-" extensions, is preserved verbatim,
-// in its original relative order, after these fields instead of being
-// silently dropped.
-//
-// "webhooks" (OpenAPI 3.1+) is included here rather than left to fall
-// through to that generic passthrough because it has the same shape as
-// "paths" — a map of Path Item Objects, each of which may itself be a
-// "$ref" — and so needs the same cross-file $ref resolution.
-var topLevelFieldOrder = []string{"openapi", "info", "servers", "paths", "webhooks", "components", "security", "tags"}
 
 func OapiYaml(inputFile, outputFile string) error {
 	data, err := os.ReadFile(inputFile)
@@ -75,96 +63,109 @@ func OapiYaml(inputFile, outputFile string) error {
 		return &MergeError{File: inputFile, Message: "Failed to read input file", Cause: err}
 	}
 
-	var doc yaml.MapSlice
-	if err := yaml.UnmarshalWithOptions(data, &doc, yaml.UseOrderedMap()); err != nil {
+	var mainAPI OpenAPI
+	if err := yaml.UnmarshalWithOptions(data, &mainAPI, yaml.UseOrderedMap()); err != nil {
 		return &MergeError{File: inputFile, Message: "Invalid OpenAPI YAML structure", Cause: err}
 	}
 
-	openapiVersion, _ := getMapSliceValue(doc, "openapi").(string)
-	if openapiVersion == "" {
+	if mainAPI.OpenAPI == "" {
 		return &MergeError{File: inputFile, Message: "Missing required field 'openapi'"}
 	}
-	info, _ := getMapSliceValue(doc, "info").(yaml.MapSlice)
-	if len(info) == 0 {
+	if len(mainAPI.Info) == 0 {
 		return &MergeError{File: inputFile, Message: "Missing required field 'info'"}
 	}
 
-	servers := getMapSliceValue(doc, "servers")
-	security := getMapSliceValue(doc, "security")
-	tags := getMapSliceValue(doc, "tags")
-	paths, _ := getMapSliceValue(doc, "paths").(yaml.MapSlice)
-	webhooksPresent := getMapSliceValue(doc, "webhooks") != nil
-	webhooks, _ := getMapSliceValue(doc, "webhooks").(yaml.MapSlice)
-	components, _ := getMapSliceValue(doc, "components").(yaml.MapSlice)
-	extra := extraTopLevelFields(doc)
+	// None of these can contain a $ref this merger needs to resolve, so
+	// they're extracted once up front and reattached after marshaling,
+	// rather than threaded through the struct or its $ref processing.
+	extra, err := extraRootFields(data)
+	if err != nil {
+		return &MergeError{File: inputFile, Message: "Invalid OpenAPI YAML structure", Cause: err}
+	}
 
 	urlsToParse := make(map[string]bool)
-	if err := processPathItemMap(&paths, urlsToParse, inputFile); err != nil {
+	if err := processPathItemMap(&mainAPI.Paths, urlsToParse, inputFile); err != nil {
 		return err
 	}
-	if err := processPathItemMap(&webhooks, urlsToParse, inputFile); err != nil {
-		return err
-	}
-
-	if err := processNestedFiles(urlsToParse, &components); err != nil {
+	if err := processPathItemMap(&mainAPI.Webhooks, urlsToParse, inputFile); err != nil {
 		return err
 	}
 
-	merged := make(yaml.MapSlice, 0, len(topLevelFieldOrder)+len(extra))
-	merged = append(merged, yaml.MapItem{Key: "openapi", Value: openapiVersion})
-	merged = append(merged, yaml.MapItem{Key: "info", Value: info})
-	if isNonEmptySequence(servers) {
-		merged = append(merged, yaml.MapItem{Key: "servers", Value: servers})
+	if err := processNestedFiles(urlsToParse, &mainAPI.Components); err != nil {
+		return err
 	}
-	merged = append(merged, yaml.MapItem{Key: "paths", Value: paths})
-	if webhooksPresent {
-		merged = append(merged, yaml.MapItem{Key: "webhooks", Value: webhooks})
-	}
-	if len(components) > 0 {
-		merged = append(merged, yaml.MapItem{Key: "components", Value: components})
-	}
-	if isNonEmptySequence(security) {
-		merged = append(merged, yaml.MapItem{Key: "security", Value: security})
-	}
-	if isNonEmptySequence(tags) {
-		merged = append(merged, yaml.MapItem{Key: "tags", Value: tags})
-	}
-	merged = append(merged, extra...)
 
-	data, err = yaml.MarshalWithOptions(merged, yaml.Indent(2), yaml.UseLiteralStyleIfMultiline(true))
+	if err := validateNoDanglingLocalRefs(&mainAPI, inputFile); err != nil {
+		return err
+	}
+
+	data, err = yaml.MarshalWithOptions(&mainAPI, yaml.Indent(2), yaml.UseLiteralStyleIfMultiline(true))
 	if err != nil {
 		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
+
+	if len(extra) > 0 {
+		data, err = appendExtraRootFields(data, extra)
+		if err != nil {
+			return fmt.Errorf("failed to marshal YAML: %w", err)
+		}
+	}
+
 	return os.WriteFile(outputFile, data, 0644)
 }
 
-// extraTopLevelFields returns the root-level entries of doc that are not
-// part of topLevelFieldOrder, preserving their original relative order.
-func extraTopLevelFields(doc yaml.MapSlice) yaml.MapSlice {
-	known := make(map[string]bool, len(topLevelFieldOrder))
-	for _, k := range topLevelFieldOrder {
-		known[k] = true
+// namedExtraRootFields lists the additional OpenAPI 3.1/3.2 root fields
+// OapiYaml preserves verbatim even though they aren't modeled by the
+// OpenAPI struct: "jsonSchemaDialect" (3.1), and "$self"/"summary"/
+// "externalDocs" (3.2 adds "$self"/"summary"; "externalDocs" predates
+// 3.1 but was likewise never modeled). None of these can contain a $ref
+// this merger resolves, so they need no special processing beyond
+// round-tripping unchanged.
+var namedExtraRootFields = map[string]bool{
+	"jsonSchemaDialect": true,
+	"$self":             true,
+	"summary":           true,
+	"externalDocs":      true,
+}
+
+// extraRootFields re-parses data generically to pull out the root fields
+// in namedExtraRootFields, plus any vendor "x-" extension, in their
+// original relative order. OapiYaml reattaches these to its own marshal
+// output via appendExtraRootFields.
+func extraRootFields(data []byte) (yaml.MapSlice, error) {
+	var raw yaml.MapSlice
+	if err := yaml.UnmarshalWithOptions(data, &raw, yaml.UseOrderedMap()); err != nil {
+		return nil, err
 	}
 
 	var extra yaml.MapSlice
-	for _, item := range doc {
+	for _, item := range raw {
 		key, ok := item.Key.(string)
-		if !ok || known[key] {
+		if !ok {
 			continue
 		}
-		extra = append(extra, item)
+		if namedExtraRootFields[key] || strings.HasPrefix(key, "x-") {
+			extra = append(extra, item)
+		}
 	}
-	return extra
+	return extra, nil
 }
 
-func isNonEmptySequence(v any) bool {
-	s, ok := v.([]any)
-	return ok && len(s) > 0
+// appendExtraRootFields re-parses marshaled (OapiYaml's own marshal
+// output for the OpenAPI struct) into a MapSlice, appends extra's items
+// after the fields already there, and re-marshals.
+func appendExtraRootFields(marshaled []byte, extra yaml.MapSlice) ([]byte, error) {
+	var doc yaml.MapSlice
+	if err := yaml.UnmarshalWithOptions(marshaled, &doc, yaml.UseOrderedMap()); err != nil {
+		return nil, err
+	}
+	doc = append(doc, extra...)
+	return yaml.MarshalWithOptions(doc, yaml.Indent(2), yaml.UseLiteralStyleIfMultiline(true))
 }
 
 // processPathItemMap resolves whole-item "$ref"s in a map of Path Item
 // Objects, fetching and inlining the referenced content. It is used for
-// both "paths" and "webhooks" (OpenAPI 3.1+), since both fields share the
+// both Paths and Webhooks (OpenAPI 3.1+), since both fields share the
 // same "name -> Path Item Object" shape.
 func processPathItemMap(paths *yaml.MapSlice, urlsToParse map[string]bool, currentFilePath string) error {
 	for i := range *paths {
@@ -290,10 +291,17 @@ func processNestedFiles(urlsToParse map[string]bool, components *yaml.MapSlice) 
 
 			if nestedComponents := getMapSliceValue(nested, "components"); nestedComponents != nil {
 				if compMap, ok := nestedComponents.(yaml.MapSlice); ok {
+					// Merge every category actually present under this file's
+					// "components:", not just componentTypes below. Since this
+					// content is already unambiguously nested under
+					// "components:", there's no need to guess at recognized
+					// category names to include it — this covers any current
+					// or future OpenAPI component category (e.g. "pathItems")
+					// without the merger needing to hard-code it.
 					mergeComponents(
 						compMap,
 						components,
-						componentTypes,
+						mapSliceKeys(compMap),
 						urlsToParse,
 						url,
 					)
@@ -315,6 +323,17 @@ func processNestedFiles(urlsToParse map[string]bool, components *yaml.MapSlice) 
 		}
 	}
 	return nil
+}
+
+// mapSliceKeys returns the string keys of m, in order.
+func mapSliceKeys(m yaml.MapSlice) []string {
+	keys := make([]string, 0, len(m))
+	for _, item := range m {
+		if key, ok := item.Key.(string); ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func mergeComponents(
@@ -391,6 +410,59 @@ func setMapSliceValue(m *yaml.MapSlice, key string, value any) {
 		}
 	}
 	*m = append(*m, yaml.MapItem{Key: key, Value: value})
+}
+
+// validateNoDanglingLocalRefs returns an error if any local "#/..." $ref
+// in mainAPI's Paths, Webhooks, or Components doesn't resolve to a value
+// that actually exists in the merged output.
+//
+// findRefs rewrites external $refs to local ones optimistically, before
+// the corresponding content has necessarily been imported — for example
+// if the referenced file's content isn't nested under a "components:"
+// object, or under a recognized component category, findRefs still
+// rewrites the reference, but nothing ever copies the target into the
+// output. This pass turns that otherwise-silent dangling reference into
+// an explicit, actionable error instead.
+func validateNoDanglingLocalRefs(mainAPI *OpenAPI, inputFile string) error {
+	// A minimal stand-in for the merged document, containing just the
+	// sections findRefs actually rewrites references within/into.
+	root := yaml.MapSlice{
+		{Key: "paths", Value: mainAPI.Paths},
+		{Key: "webhooks", Value: mainAPI.Webhooks},
+		{Key: "components", Value: mainAPI.Components},
+	}
+
+	var fragments []string
+	collectLocalRefs(root, &fragments)
+
+	for _, fragment := range fragments {
+		if _, err := navigateToFragment(root, fragment, inputFile); err != nil {
+			return &MergeError{File: inputFile, Path: fragment, Message: fmt.Sprintf("Reference '#%s' does not resolve to a merged value", fragment)}
+		}
+	}
+	return nil
+}
+
+// collectLocalRefs appends the fragment (including its leading "/") of
+// every local "$ref: '#/...'" found anywhere under v to *fragments.
+func collectLocalRefs(v any, fragments *[]string) {
+	switch vt := v.(type) {
+	case yaml.MapSlice:
+		for _, item := range vt {
+			key, _ := item.Key.(string)
+			if key == "$ref" {
+				if refStr, ok := item.Value.(string); ok && strings.HasPrefix(refStr, "#/") {
+					*fragments = append(*fragments, strings.TrimPrefix(refStr, "#"))
+				}
+				continue
+			}
+			collectLocalRefs(item.Value, fragments)
+		}
+	case []any:
+		for _, item := range vt {
+			collectLocalRefs(item, fragments)
+		}
+	}
 }
 
 func resolveRef(relativePath, currentFilePath string) string {

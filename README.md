@@ -12,8 +12,8 @@
 
 - **Resolves `$ref` References**: Automatically resolves and merges external references in OpenAPI files.
 - **OpenAPI 3.0, 3.1, and 3.2 Support**: Merges documents on any of these versions, including native OpenAPI 3.2 hierarchical tags (`tags[].parent`).
-- **Lossless for Unknown Fields**: Any root-level field the tool doesn't specifically process — vendor `x-*` extensions, `jsonSchemaDialect`, `$self`, `summary`, or fields introduced by future OpenAPI versions — passes through untouched instead of being silently dropped.
 - **`webhooks` Support (OpenAPI 3.1+)**: `webhooks` entries are resolved and merged the same way as `paths` — a whole-item `$ref` to another file is fetched, inlined, and any refs nested inside it are followed and merged into `components` too.
+- **Preserves Other Root-Level Fields**: `jsonSchemaDialect` (3.1), `$self`/`summary` (3.2), `externalDocs`, and vendor `x-*` extensions are carried through to the output unchanged, even though none of them get `$ref` resolution.
 - **Simple CLI Interface**: Easy-to-use command-line tool for quick integration into your workflow.
 - **Customizable Input/Output**: Specify input and output file paths for flexible usage.
 - **Cross-Platform**: Built in Go, it works seamlessly on Windows, macOS, and Linux.
@@ -27,10 +27,16 @@
 In practice this means:
 
 - **OpenAPI 3.0.x**: Fully supported. This is the format the tool was originally built around.
-- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`jsonSchemaDialect`, etc.) are preserved rather than dropped, and `webhooks` gets the same `$ref` resolution as `paths` (see above).
-- **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below) and other 3.2-only fields such as `$self`, which are preserved as-is.
+- **OpenAPI 3.1.x**: Supported for the fields the merger models (`info`, `servers`, `paths`, `webhooks`, `components`, `security`, `tags`). `webhooks` gets the same `$ref` resolution as `paths` (see above).
+- **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below).
 
 Because the tool merges YAML structurally rather than validating against a JSON Schema for a specific OpenAPI version, it does not by itself guarantee the *output* is spec-valid — it guarantees it faithfully reflects the *input*. Run the result through an OpenAPI validator (e.g. [Redocly CLI](https://redocly.com/docs/cli/) or [Spectral](https://github.com/stoplightio/spectral)) as part of your pipeline if you need that guarantee.
+
+### Root fields the merger preserves without processing
+
+The merger models a fixed set of root fields that need active processing (`openapi`, `info`, `servers`, `paths`, `webhooks`, `components`, `security`, `tags`). Beyond those, it also recognizes and preserves `jsonSchemaDialect` (3.1), `$self`/`summary`/`externalDocs` (3.2, though `externalDocs` predates 3.1), and any root-level vendor `x-*` extension — copied through verbatim, in their original relative order, positioned after the modeled fields in the output. None of these can contain a `$ref`, so no resolution is attempted on them.
+
+Any *other* unrecognized root-level field (a hypothetical future OpenAPI addition not listed above) is still dropped, since it isn't in this preserved set either.
 
 ---
 
@@ -135,6 +141,10 @@ Error: open api.yaml: no such file or directory
 1. **Reads the Main File**: The tool starts by reading the main OpenAPI file specified with the `-input` flag.
 2. **Resolves References**: It identifies `$ref` references, reads the linked files, and merges their content into the main file.
 3. **Saves the Result**: The final merged OpenAPI specification is saved to the file specified with the `-output` flag.
+
+### A note on `$ref` detection
+
+Step 2 looks for a key literally named `$ref` anywhere in the document and treats it as a cross-file reference — it does not distinguish that from an OpenAPI Schema/Media Type `example` (or similarly arbitrary literal data) that happens to contain a value shaped like `{$ref: '...'}`. If you have literal example/default data shaped that way, the merger will either fail with a "file not found" error (if no such file exists) or substitute that file's content in place of your literal data (if one coincidentally does). Avoid using a bare `{$ref: ...}`-shaped value as literal example data if you hit this.
 
 ---
 

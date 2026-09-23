@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,7 +154,7 @@ users:
   get:
     responses:
       "200":
-        $ref: './responses.yaml#/responses/OK'
+        $ref: './responses.yaml#/components/responses/OK'
 
 components:
   schemas:
@@ -161,9 +162,10 @@ components:
       type: object
 `)
 	writeFile(t, filepath.Join(tmpDir, "responses.yaml"), `
-responses:
-  OK:
-    description: Success
+components:
+  responses:
+    OK:
+      description: Success
 `)
 	writeFile(t, input, `
 openapi: "3.0.0"
@@ -791,7 +793,15 @@ components:
 	}
 }
 
-func TestOapiYamlPreservesUnknownTopLevelFields(t *testing.T) {
+// TestOapiYamlPreservesExtraRootFields covers the root-level fields
+// OapiYaml preserves verbatim even though they aren't modeled by the
+// OpenAPI struct: OpenAPI 3.1's "jsonSchemaDialect", 3.2's "$self"/
+// "summary", "externalDocs", and vendor "x-" extensions. None of these
+// can contain a $ref, so they round-trip unprocessed. "webhooks" *is*
+// modeled by the struct and gets full $ref resolution; that's covered
+// separately in TestOapiYamlResolvesWebhookReferences and
+// TestOapiYamlOmitsAbsentWebhooks.
+func TestOapiYamlPreservesExtraRootFields(t *testing.T) {
 	tmpDir := t.TempDir()
 	input := filepath.Join(tmpDir, "api.yaml")
 	output := filepath.Join(tmpDir, "out.yaml")
@@ -809,14 +819,11 @@ paths:
       responses:
         "200":
           description: OK
-webhooks:
-  newItem:
-    post:
-      summary: New item webhook
-      responses:
-        "200":
-          description: OK
+externalDocs:
+  description: Find out more
+  url: https://example.com/docs
 x-custom-extension: hello
+$self: https://example.com/api
 `)
 	if err := OapiYaml(input, output); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -833,21 +840,64 @@ x-custom-extension: hello
 	if got := getMapSliceValue(doc, "x-custom-extension"); got != "hello" {
 		t.Errorf("x-custom-extension = %v, want %q", got, "hello")
 	}
-	webhooks, ok := getMapSliceValue(doc, "webhooks").(yaml.MapSlice)
-	if !ok {
-		t.Fatalf("webhooks missing or wrong type")
+	if got := getMapSliceValue(doc, "$self"); got != "https://example.com/api" {
+		t.Errorf("$self = %v, want %q", got, "https://example.com/api")
 	}
-	if got := mapValueAt(t, webhooks, "newItem", "post", "summary"); got != "New item webhook" {
-		t.Errorf("webhooks.newItem.post.summary = %v", got)
+	externalDocs, ok := getMapSliceValue(doc, "externalDocs").(yaml.MapSlice)
+	if !ok {
+		t.Fatalf("externalDocs missing or wrong type")
+	}
+	if got := getMapSliceValue(externalDocs, "url"); got != "https://example.com/docs" {
+		t.Errorf("externalDocs.url = %v", got)
 	}
 
-	// Each unknown field must appear exactly once in the output.
+	// Extra fields must appear after the known struct fields, and in
+	// their original relative order.
 	data, err := os.ReadFile(output)
 	if err != nil {
 		t.Fatalf("read output: %v", err)
 	}
-	if n := strings.Count(string(data), "x-custom-extension:"); n != 1 {
-		t.Errorf("x-custom-extension appears %d times, want 1", n)
+	content := string(data)
+	idxPaths := strings.Index(content, "paths:")
+	idxSummary := strings.Index(content, "summary:")
+	idxJSONSchemaDialect := strings.Index(content, "jsonSchemaDialect:")
+	idxExternalDocs := strings.Index(content, "externalDocs:")
+	idxExtension := strings.Index(content, "x-custom-extension:")
+	idxSelf := strings.Index(content, "$self:")
+	if idxPaths == -1 || idxPaths > idxSummary {
+		t.Error("paths should come before the extra root fields")
+	}
+	if !(idxSummary < idxJSONSchemaDialect && idxJSONSchemaDialect < idxExternalDocs && idxExternalDocs < idxExtension && idxExtension < idxSelf) {
+		t.Error("extra root fields should preserve their original relative order")
+	}
+}
+
+func TestOapiYamlOmitsAbsentExtraRootFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	for _, key := range []string{"summary", "jsonSchemaDialect", "$self", "externalDocs"} {
+		if got := getMapSliceValue(doc, key); got != nil {
+			t.Errorf("%s should be absent, got %v", key, got)
+		}
 	}
 }
 
@@ -1118,4 +1168,985 @@ func mapValueAt(t *testing.T, root yaml.MapSlice, keys ...string) any {
 	}
 
 	return value
+}
+
+// --- MergeError ---
+
+func TestMergeErrorMessageFormatting(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *MergeError
+		want string
+	}{
+		{
+			name: "message only",
+			err:  &MergeError{Message: "something went wrong"},
+			want: "something went wrong",
+		},
+		{
+			name: "message and file",
+			err:  &MergeError{Message: "something went wrong", File: "api.yaml"},
+			want: "something went wrong (in api.yaml)",
+		},
+		{
+			name: "message, file, and path",
+			err:  &MergeError{Message: "something went wrong", File: "api.yaml", Path: "/users"},
+			want: "something went wrong (in api.yaml at /users)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Errorf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeErrorUnwrap(t *testing.T) {
+	cause := errors.New("underlying cause")
+	err := &MergeError{Message: "wrapped", Cause: cause}
+
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is(err, cause) = false, want true")
+	}
+	if err.Unwrap() != cause {
+		t.Errorf("Unwrap() = %v, want %v", err.Unwrap(), cause)
+	}
+}
+
+// --- Error paths through OapiYaml ---
+
+func TestOapiYamlInvalidYAMLSyntax(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info: [this is not valid
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for malformed YAML")
+	}
+	if !strings.Contains(err.Error(), "Invalid OpenAPI YAML structure") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlInvalidRefFormatInPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './missing-fragment.yaml'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for $ref missing a fragment")
+	}
+	if !strings.Contains(err.Error(), "missing fragment") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlInvalidRefFormatInWebhooks(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: 3.1.0
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+webhooks:
+  newItem:
+    $ref: './missing-fragment.yaml'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for $ref missing a fragment")
+	}
+	if !strings.Contains(err.Error(), "missing fragment") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlUnreadableRefFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './missing.yaml#/test'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for unreadable ref target")
+	}
+	if !strings.Contains(err.Error(), "Cannot read referenced file") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlRefTargetInvalidYAML(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test: [this is not valid`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#/test'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for malformed ref target YAML")
+	}
+	if !strings.Contains(err.Error(), "Invalid YAML syntax") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlRefTargetNotAnObject(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test: "just a string, not a path item"`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#/test'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for a ref target that isn't an object")
+	}
+	if !strings.Contains(err.Error(), "Invalid reference target") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlRefFragmentKeyNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test:
+  get:
+    responses:
+      "200":
+        description: OK
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#/nonexistent'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for a fragment key that doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlRefFragmentInvalidStructure(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test: "a scalar, not a map"`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#/test/deeper'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error navigating past a scalar")
+	}
+	if !strings.Contains(err.Error(), "Invalid reference structure") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlRefFragmentWithoutLeadingSlash(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test:
+  get:
+    responses:
+      "200":
+        description: OK
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#test'
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error resolving a fragment without a leading slash: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths_, _ := docPathsAndComponents(t, doc)
+	if got := mapValueAt(t, paths_, "/test", "get", "responses", "200", "description"); got != "OK" {
+		t.Errorf("description = %v, want OK", got)
+	}
+}
+
+func TestOapiYamlRefFragmentWithDoubleSlash(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, paths, `test:
+  get:
+    responses:
+      "200":
+        description: OK
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    $ref: './paths.yaml#//test'
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error resolving a fragment with an empty segment: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths_, _ := docPathsAndComponents(t, doc)
+	if got := mapValueAt(t, paths_, "/test", "get", "responses", "200", "description"); got != "OK" {
+		t.Errorf("description = %v, want OK", got)
+	}
+}
+
+func TestOapiYamlSkipsNonObjectPathItem(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /weird: "not an object"
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths, _ := docPathsAndComponents(t, doc)
+	if got := getMapSliceValue(paths, "/weird"); got != "not an object" {
+		t.Errorf("/weird = %v, want unchanged string", got)
+	}
+	if got := mapValueAt(t, paths, "/test", "get", "responses", "200", "description"); got != "OK" {
+		t.Errorf("description = %v, want OK", got)
+	}
+}
+
+func TestOapiYamlNestedFileReadFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	// paths.yaml's own components reference a file that doesn't exist. Since
+	// the root document has no pre-existing "User" schema, this reference
+	// isn't discarded as a duplicate and gets queued for merging, so the
+	// missing file surfaces as a real error from processNestedFiles.
+	writeFile(t, paths, `
+users:
+  get:
+    responses:
+      "200":
+        description: OK
+
+components:
+  schemas:
+    User:
+      $ref: './missing.yaml#/components/schemas/User'
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /users:
+    $ref: './paths.yaml#/users'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for a transitively referenced file that doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "failed to read") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestOapiYamlNestedFileInvalidYAML(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	paths := filepath.Join(tmpDir, "paths.yaml")
+	broken := filepath.Join(tmpDir, "broken.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, broken, `components: [this is not valid`)
+	writeFile(t, paths, `
+users:
+  get:
+    responses:
+      "200":
+        description: OK
+
+components:
+  schemas:
+    User:
+      $ref: './broken.yaml#/components/schemas/User'
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /users:
+    $ref: './paths.yaml#/users'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for a transitively referenced file with invalid YAML")
+	}
+	if !strings.Contains(err.Error(), "failed to parse") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- Root fields not otherwise covered ---
+
+func TestOapiYamlServersRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+servers:
+  - url: https://api.example.com/v1
+    description: Production
+  - url: https://staging.example.com/v1
+    description: Staging
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	servers, ok := getMapSliceValue(doc, "servers").([]any)
+	if !ok {
+		t.Fatalf("servers missing or wrong type")
+	}
+	if len(servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(servers))
+	}
+	first, ok := servers[0].(yaml.MapSlice)
+	if !ok {
+		t.Fatalf("servers[0] has wrong type: %T", servers[0])
+	}
+	if got := getMapSliceValue(first, "url"); got != "https://api.example.com/v1" {
+		t.Errorf("servers[0].url = %v", got)
+	}
+
+	// servers must be positioned before paths in the output.
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	content := string(data)
+	if idxServers, idxPaths := strings.Index(content, "servers:"), strings.Index(content, "paths:"); idxServers == -1 || idxServers > idxPaths {
+		t.Error("servers should appear before paths in the output")
+	}
+}
+
+func TestOapiYamlEmptyServersSecurityTagsOmitted(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+servers: []
+security: []
+tags: []
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	for _, key := range []string{"servers", "security", "tags"} {
+		if getMapSliceValue(doc, key) != nil {
+			t.Errorf("%s should be omitted from output when empty in input", key)
+		}
+	}
+}
+
+// --- Deprecated compatibility type ---
+
+func TestOpenAPITypeRoundTrips(t *testing.T) {
+	data := []byte(`
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+servers:
+  - url: https://api.example.com
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+webhooks:
+  newItem:
+    post:
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    User:
+      type: object
+security:
+  - bearerAuth: []
+tags:
+  - name: test
+`)
+
+	var doc OpenAPI
+	if err := yaml.UnmarshalWithOptions(data, &doc, yaml.UseOrderedMap()); err != nil {
+		t.Fatalf("unmarshal into OpenAPI type: %v", err)
+	}
+
+	if doc.OpenAPI != "3.0.0" {
+		t.Errorf("OpenAPI = %q, want 3.0.0", doc.OpenAPI)
+	}
+	if len(doc.Servers) != 1 {
+		t.Errorf("expected 1 server, got %d", len(doc.Servers))
+	}
+	if got := mapValueAt(t, doc.Paths, "/test", "get", "responses", "200", "description"); got != "OK" {
+		t.Errorf("description = %v, want OK", got)
+	}
+	if got := mapValueAt(t, doc.Webhooks, "newItem", "post", "responses", "200", "description"); got != "OK" {
+		t.Errorf("webhooks description = %v, want OK", got)
+	}
+	if got := mapValueAt(t, doc.Components, "schemas", "User", "type"); got != "object" {
+		t.Errorf("User.type = %v, want object", got)
+	}
+	if len(doc.Security) != 1 {
+		t.Errorf("expected 1 security requirement, got %d", len(doc.Security))
+	}
+	if len(doc.Tags) != 1 {
+		t.Errorf("expected 1 tag, got %d", len(doc.Tags))
+	}
+
+	out, err := yaml.MarshalWithOptions(&doc, yaml.Indent(2))
+	if err != nil {
+		t.Fatalf("marshal OpenAPI type: %v", err)
+	}
+	if !strings.Contains(string(out), "openapi: 3.0.0") {
+		t.Errorf("marshaled output missing openapi version:\n%s", out)
+	}
+}
+
+// --- Root field type validation ---
+//
+// OapiYaml parses into the fixed OpenAPI struct, so a wrongly-typed known
+// root field (e.g. a mapping where an array is expected) fails the
+// unmarshal outright, rather than being silently dropped from the
+// output. The underlying goccy/go-yaml error (available via
+// errors.Unwrap) names the mismatch directly; MergeError's own top-level
+// message is intentionally generic (see TestMergeErrorMessageFormatting).
+
+func TestOapiYamlRejectsMistypedSecurity(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	// security must be an array of security requirement objects, not a
+	// single mapping.
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+security:
+  BearerAuth: []
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected error for mistyped security field")
+	}
+	cause := errors.Unwrap(err)
+	if cause == nil || !strings.Contains(cause.Error(), "sequence") {
+		t.Errorf("unexpected error: %v (cause: %v)", err, cause)
+	}
+}
+
+func TestOapiYamlRejectsMistypedServersAndTags(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"servers as mapping", "servers:\n  url: https://example.com\n"},
+		{"tags as mapping", "tags:\n  name: test\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			input := filepath.Join(tmpDir, "api.yaml")
+			output := filepath.Join(tmpDir, "out.yaml")
+
+			writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+`+tt.yaml+`
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`)
+			err := OapiYaml(input, output)
+			if err == nil {
+				t.Fatalf("expected error for %s", tt.name)
+			}
+			cause := errors.Unwrap(err)
+			if cause == nil || !strings.Contains(cause.Error(), "sequence") {
+				t.Errorf("unexpected error: %v (cause: %v)", err, cause)
+			}
+		})
+	}
+}
+
+func TestOapiYamlRejectsMistypedComponentsPathsWebhooks(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"components as array", "components:\n  - oops\n"},
+		{"paths as array", "paths:\n  - oops\n"},
+		{"webhooks as array", "webhooks:\n  - oops\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			input := filepath.Join(tmpDir, "api.yaml")
+			output := filepath.Join(tmpDir, "out.yaml")
+
+			body := `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+` + tt.yaml
+			if tt.name != "paths as array" {
+				body += `
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+`
+			}
+
+			writeFile(t, input, body)
+			err := OapiYaml(input, output)
+			if err == nil {
+				t.Fatalf("expected error for %s", tt.name)
+			}
+			cause := errors.Unwrap(err)
+			if cause == nil || !strings.Contains(cause.Error(), "mapping") {
+				t.Errorf("unexpected error: %v (cause: %v)", err, cause)
+			}
+		})
+	}
+}
+
+// --- Literal "example" data is not distinguished from real references ---
+//
+// findRefs follows every "$ref" it finds, unconditionally. This is a
+// known, accepted limitation: an OpenAPI Schema/Media Type "example"
+// field that happens to contain a literal value shaped like a Reference
+// Object (a map with only a "$ref" key) is indistinguishable from a real
+// one and gets treated as such — surfacing as a clear "file not found"
+// error if no such file exists, or, if one coincidentally does, having
+// its content substituted in place of the literal example. Avoid using a
+// bare {$ref: ...}-shaped value as literal example/default data.
+
+func TestOapiYamlLiteralExampleShapedLikeARefErrorsClearly(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                $ref: 'not-a-file.yaml#/data'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected an error: 'not-a-file.yaml' looks like an external $ref and doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "failed to read") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- Generic component category merging ---
+
+func TestOapiYamlMergesUnlistedComponentCategories(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	extra := filepath.Join(tmpDir, "extra.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	// "pathItems" (and this made-up "widgets" category) aren't in the
+	// hardcoded componentTypes list, but since they're nested under a
+	// "components:" object they should still be merged generically.
+	writeFile(t, extra, `
+components:
+  pathItems:
+    Reusable:
+      get:
+        responses:
+          "200":
+            description: OK
+  widgets:
+    Gadget:
+      type: object
+`)
+	writeFile(t, input, `
+openapi: 3.1.0
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: './extra.yaml#/components/widgets/Gadget'
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	_, components := docPathsAndComponents(t, doc)
+
+	if got := mapValueAt(t, components, "widgets", "Gadget", "type"); got != "object" {
+		t.Errorf("widgets.Gadget.type = %v, want object", got)
+	}
+	if got := mapValueAt(t, components, "pathItems", "Reusable", "get", "responses", "200", "description"); got != "OK" {
+		t.Errorf("pathItems.Reusable... description = %v, want OK", got)
+	}
+}
+
+// --- Dangling local reference detection ---
+
+func TestOapiYamlRejectsDanglingReferenceToUnimportableTarget(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	definitions := filepath.Join(tmpDir, "definitions.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	// "Pet" lives at the bare top level of definitions.yaml: no
+	// "components:" wrapper, and not a recognized component category name,
+	// so nothing ever copies it into the merged output. The rewritten
+	// local ref "#/Pet" would otherwise dangle silently.
+	writeFile(t, definitions, `
+Pet:
+  type: object
+  properties:
+    name:
+      type: string
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: './definitions.yaml#/Pet'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected an explicit error for a reference that can't be imported")
+	}
+	if !strings.Contains(err.Error(), "does not resolve") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestOapiYamlLiteralExampleShapedLikeALocalRefErrorsClearly is the
+// dangling-reference-check counterpart of
+// TestOapiYamlLiteralExampleShapedLikeARefErrorsClearly: a literal
+// example value shaped like an already-local ($ref: '#/...') Reference
+// Object is, for the same reason, indistinguishable from a real one, and
+// the dangling-reference validator correctly (if not exactly
+// intentionally) flags it when the "referenced" value doesn't exist.
+func TestOapiYamlLiteralExampleShapedLikeALocalRefErrorsClearly(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                $ref: '#/components/schemas/DoesNotExist'
+`)
+	err := OapiYaml(input, output)
+	if err == nil {
+		t.Fatal("expected an error: the literal example ref doesn't resolve to anything merged")
+	}
+	if !strings.Contains(err.Error(), "does not resolve") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- "example" as an author-chosen name, not the literal-data keyword ---
+//
+// isLiteralDataKey("example") must only apply when "example" is the
+// OpenAPI Schema/Media Type keyword. A schema property, or a reusable
+// components.examples entry, can itself be named "example" — in which
+// case its value is an ordinary nested object (a Schema Object, or an
+// Example Object that may legitimately be a $ref) that must still be
+// scanned normally.
+
+func TestOapiYamlResolvesRefUnderPropertyNamedExample(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	schemas := filepath.Join(tmpDir, "schemas.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, schemas, `
+components:
+  schemas:
+    Snippet:
+      type: object
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  example:
+                    $ref: './schemas.yaml#/components/schemas/Snippet'
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths, components := docPathsAndComponents(t, doc)
+
+	schemaRef := mapValueAt(t, paths, "/test", "get", "responses", "200", "content", "application/json", "schema", "properties", "example", "$ref")
+	if schemaRef != "#/components/schemas/Snippet" {
+		t.Errorf("properties.example.$ref = %v, want #/components/schemas/Snippet", schemaRef)
+	}
+	if got := mapValueAt(t, components, "schemas", "Snippet", "type"); got != "object" {
+		t.Errorf("Snippet.type = %v, want object", got)
+	}
+}
+
+func TestOapiYamlResolvesRefUnderComponentsExampleNamedExample(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	shared := filepath.Join(tmpDir, "shared.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	// A reusable Example Object named "example" (components.examples.example)
+	// that is itself a $ref to another file.
+	writeFile(t, shared, `
+components:
+  examples:
+    RealExample:
+      value:
+        name: sample
+`)
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              examples:
+                example:
+                  $ref: './shared.yaml#/components/examples/RealExample'
+`)
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths, components := docPathsAndComponents(t, doc)
+
+	ref := mapValueAt(t, paths, "/test", "get", "responses", "200", "content", "application/json", "examples", "example", "$ref")
+	if ref != "#/components/examples/RealExample" {
+		t.Errorf("examples.example.$ref = %v, want #/components/examples/RealExample", ref)
+	}
+	if got := mapValueAt(t, components, "examples", "RealExample", "value", "name"); got != "sample" {
+		t.Errorf("RealExample.value.name = %v, want sample", got)
+	}
 }
