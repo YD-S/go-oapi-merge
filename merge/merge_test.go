@@ -923,6 +923,116 @@ components:
 	}
 }
 
+func TestOapiYamlResolvesNestedRefsInInlinePaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	schemas := filepath.Join(tmpDir, "schemas.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: './schemas.yaml#/components/schemas/Item'
+`)
+	writeFile(t, schemas, `
+components:
+  schemas:
+    Item:
+      type: object
+      properties:
+        name:
+          type: string
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	paths, components := docPathsAndComponents(t, doc)
+
+	// The nested external $ref must be rewritten to a local ref, not left
+	// pointing at the other file.
+	schemaRef := mapValueAt(t, paths, "/test", "get", "responses", "200", "content", "application/json", "schema", "$ref")
+	if schemaRef != "#/components/schemas/Item" {
+		t.Errorf("inline path schema ref = %v, want #/components/schemas/Item", schemaRef)
+	}
+	if got := mapValueAt(t, components, "schemas", "Item", "type"); got != "object" {
+		t.Errorf("Item.type = %v, want object", got)
+	}
+}
+
+func TestOapiYamlResolvesNestedRefsInInlineWebhooks(t *testing.T) {
+	tmpDir := t.TempDir()
+	input := filepath.Join(tmpDir, "api.yaml")
+	schemas := filepath.Join(tmpDir, "schemas.yaml")
+	output := filepath.Join(tmpDir, "out.yaml")
+
+	writeFile(t, input, `
+openapi: 3.1.0
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /test:
+    get:
+      responses:
+        "200":
+          description: OK
+webhooks:
+  newItem:
+    post:
+      summary: New item webhook
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: './schemas.yaml#/components/schemas/Item'
+      responses:
+        "200":
+          description: OK
+`)
+	writeFile(t, schemas, `
+components:
+  schemas:
+    Item:
+      type: object
+      properties:
+        name:
+          type: string
+`)
+
+	if err := OapiYaml(input, output); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc := unmarshalDoc(t, output)
+	webhooks, ok := getMapSliceValue(doc, "webhooks").(yaml.MapSlice)
+	if !ok {
+		t.Fatalf("webhooks missing or wrong type")
+	}
+
+	schemaRef := mapValueAt(t, webhooks, "newItem", "post", "requestBody", "content", "application/json", "schema", "$ref")
+	if schemaRef != "#/components/schemas/Item" {
+		t.Errorf("inline webhook schema ref = %v, want #/components/schemas/Item", schemaRef)
+	}
+	_, components := docPathsAndComponents(t, doc)
+	if got := mapValueAt(t, components, "schemas", "Item", "type"); got != "object" {
+		t.Errorf("Item.type = %v, want object", got)
+	}
+}
+
 func TestOapiYamlOmitsAbsentWebhooks(t *testing.T) {
 	tmpDir := t.TempDir()
 	input := filepath.Join(tmpDir, "api.yaml")

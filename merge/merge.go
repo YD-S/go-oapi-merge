@@ -35,6 +35,26 @@ func (e *MergeError) Unwrap() error {
 	return e.Cause
 }
 
+// OpenAPI is kept for source compatibility with code that imports this
+// package as a library and unmarshals/constructs documents with it
+// directly.
+//
+// Deprecated: OapiYaml no longer uses this type internally. it parses
+// the whole document as a generic yaml.MapSlice instead, so that root
+// fields this struct doesn't know about (OpenAPI 3.1/3.2 additions such
+// as "webhooks", "jsonSchemaDialect", "$self", "summary", or vendor "x-"
+// extensions) aren't silently dropped during merge. This type will be
+// removed in a future major version.
+type OpenAPI struct {
+	OpenAPI    string        `yaml:"openapi"`
+	Info       yaml.MapSlice `yaml:"info"`
+	Servers    []any         `yaml:"servers,omitempty"`
+	Paths      yaml.MapSlice `yaml:"paths"`
+	Components yaml.MapSlice `yaml:"components,omitempty"`
+	Security   []any         `yaml:"security,omitempty"`
+	Tags       []any         `yaml:"tags,omitempty"`
+}
+
 // topLevelFieldOrder defines the canonical ordering of the well-known
 // OpenAPI root fields in the merged output. The document is otherwise
 // parsed generically (see OapiYaml) so that any other root-level field,
@@ -157,12 +177,16 @@ func processPathItemMap(paths *yaml.MapSlice, urlsToParse map[string]bool, curre
 		}
 
 		refValue := getMapSliceValue(pathMap, "$ref")
-		if refValue == nil {
-			continue
-		}
+		refStr, isExternalRef := refValue.(string)
+		isExternalRef = isExternalRef && !strings.HasPrefix(refStr, "#")
 
-		refStr, ok := refValue.(string)
-		if !ok || strings.HasPrefix(refStr, "#") {
+		if !isExternalRef {
+			// Not a whole-item external $ref: this is an inline path/webhook
+			// item, which may still contain external $refs nested inside its
+			// operations (e.g. a response or request body schema). Those need
+			// the same treatment findRefs already gives fetched content below.
+			findRefs(&pathMap, urlsToParse, currentFilePath)
+			(*paths)[i].Value = pathMap
 			continue
 		}
 

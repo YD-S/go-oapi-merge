@@ -27,8 +27,8 @@
 In practice this means:
 
 - **OpenAPI 3.0.x**: Fully supported. This is the format the tool was originally built around.
-- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`jsonSchemaDialect`, root-level `$ref` via `$self`, etc.) are preserved rather than dropped, and `webhooks` gets the same `$ref` resolution as `paths` (see above).
-- **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below). As with 3.1, any 3.2-specific root field is preserved as-is.
+- **OpenAPI 3.1.x**: Supported. The merger operates on the YAML structure generically, so 3.1-only fields (`jsonSchemaDialect`, etc.) are preserved rather than dropped, and `webhooks` gets the same `$ref` resolution as `paths` (see above).
+- **OpenAPI 3.2.x**: Supported, including native hierarchical tags (see below) and other 3.2-only fields such as `$self`, which are preserved as-is.
 
 Because the tool merges YAML structurally rather than validating against a JSON Schema for a specific OpenAPI version, it does not by itself guarantee the *output* is spec-valid — it guarantees it faithfully reflects the *input*. Run the result through an OpenAPI validator (e.g. [Redocly CLI](https://redocly.com/docs/cli/) or [Spectral](https://github.com/stoplightio/spectral)) as part of your pipeline if you need that guarantee.
 
